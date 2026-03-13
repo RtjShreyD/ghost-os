@@ -6,13 +6,19 @@
 // The sidecar handles ShowUI-2B (VLM grounding) and future YOLO detection.
 //
 // Architecture:
-//   ghost_parse_screen → screenshot → sidecar /detect → structured elements
+//   ghost_parse_screen → AX tree + CDP fallback → structured elements
+//                        (future: sidecar /detect → YOLO bounding boxes)
 //   ghost_ground       → screenshot → sidecar /ground → (x, y) coordinates
 //
-// Both tools take a screenshot automatically using the existing ScreenCapture
-// module, then send it to the sidecar for processing.
+// ghost_parse_screen works WITHOUT the vision sidecar — it collects
+// interactive elements from the AX tree (native apps) or Chrome DevTools
+// Protocol (web apps). The sidecar is only needed for ghost_ground.
+//
+// When YOLO detection is implemented in the sidecar, ghost_parse_screen
+// will call /detect as a first-pass visual sweep, then layer AX data on top.
 
 import AppKit
+import AXorcist
 import Foundation
 
 /// Vision-based perception: when the AX tree isn't enough.
@@ -20,18 +26,22 @@ public enum VisionPerception {
 
     // MARK: - ghost_parse_screen
 
-    /// Detect all interactive UI elements using vision.
-    /// Takes a screenshot and sends it to the vision sidecar for YOLO detection.
+    /// Detect all interactive UI elements on the screen.
+    ///
+    /// Collection strategy (layered, most-to-least reliable):
+    ///   1. AX tree — works perfectly for native macOS apps.
+    ///   2. Chrome DevTools Protocol — falls back to CDP when Chrome's AX tree
+    ///      returns only empty AXGroup nodes (typical for Gmail, Slack web, etc.).
+    ///   3. Future: vision sidecar /detect (YOLO) — not yet implemented.
+    ///      When available, it will detect elements that neither AX nor CDP can see.
+    ///
+    /// The vision sidecar is NOT required to run this tool. Call ``VisionPerception/groundElement(description:appName:cropBox:)``
+    /// for VLM-based grounding of individual elements that this tool cannot find.
     public static func parseScreen(
         appName: String?,
         fullResolution: Bool
     ) -> ToolResult {
-        // Check sidecar availability
-        guard VisionBridge.isAvailable() else {
-            return sidecarUnavailableResult(tool: "ghost_parse_screen")
-        }
-
-        // Take screenshot
+        // Take screenshot for context (we always capture so callers can verify the result)
         guard let screenshot = captureForVision(appName: appName, fullResolution: fullResolution) else {
             return ToolResult(
                 success: false,
@@ -40,20 +50,309 @@ public enum VisionPerception {
             )
         }
 
-        // For now, return the health status since YOLO detection is not yet implemented.
-        // When implemented, this will call /detect and return structured elements.
-        let health = VisionBridge.healthCheck()
+        // ── Strategy 1: AX tree ───────────────────────────────────────────────────
+        // Collect interactive elements with screen-absolute bounding boxes.
+        // This is fast (~10ms) and accurate for native macOS apps.
+        var elements: [[String: Any]] = []
+        var detectionMethod = "ax-tree"
+        var appDisplayName: String = appName ?? "frontmost app"
+
+        let targetApp: NSRunningApplication?
+        if let appName {
+            targetApp = Perception.findApp(named: appName)
+            if targetApp == nil {
+                Log.warn("parseScreen: app '\(appName)' not found — skipping AX collection")
+            }
+        } else {
+            targetApp = NSWorkspace.shared.frontmostApplication
+        }
+
+        if let app = targetApp {
+            appDisplayName = app.localizedName ?? appDisplayName
+            collectAXElements(
+                for: app,
+                screenshot: screenshot,
+                results: &elements
+            )
+        }
+
+        // ── Strategy 2: CDP fallback for web apps ─────────────────────────────────
+        // Chrome exposes web content as deeply nested AXGroup nodes, so AX yields
+        // very few (or zero) useful elements for Gmail, Notion, Slack web, etc.
+        // CDP queries the real DOM and returns aria-labels, roles, and bounding boxes.
+        // CDP coordinates are viewport-relative; we convert them to screen-absolute
+        // using the Chrome window origin + toolbar height.
+        var cdpAvailable = false
+        if elements.count < minAXElementsBeforeCDPFallback, CDPBridge.isAvailable() {
+            cdpAvailable = true
+
+            // Get Chrome window origin for viewport → screen conversion
+            let windowOrigin: (x: Double, y: Double)
+            if let app = targetApp,
+               let appElement = Element.application(for: app.processIdentifier),
+               let window = appElement.focusedWindow(),
+               let pos = window.position()
+            {
+                windowOrigin = (Double(pos.x), Double(pos.y))
+            } else {
+                windowOrigin = (0, 0)
+            }
+
+            if let cdpElements = CDPBridge.findElements(query: "") {
+                // CDPBridge.findElements("") passes an empty query string.
+                // In the CDP JavaScript, every string includes the empty string,
+                // so this matches all elements with aria-label, placeholder,
+                // button/link text, labels, title, or alt attributes.
+                // CDPBridge caps results at 20 elements per call.
+                let cdpSummaries: [[String: Any]] = cdpElements.compactMap { el in
+                    guard let vx = el["centerX"] as? Int,
+                          let vy = el["centerY"] as? Int
+                    else { return nil }
+
+                    // Convert viewport coords to screen-absolute coords
+                    let screen = CDPBridge.viewportToScreen(
+                        viewportX: Double(vx),
+                        viewportY: Double(vy),
+                        windowX: windowOrigin.x,
+                        windowY: windowOrigin.y
+                    )
+
+                    var summary: [String: Any] = [
+                        "role": el["role"] as? String ?? el["tag"] as? String ?? "unknown",
+                        "name": (el["ariaLabel"] as? String)?.isEmpty == false
+                                    ? el["ariaLabel"]!
+                                    : el["text"] as? String ?? "",
+                        "position": ["x": Int(screen.x), "y": Int(screen.y)],
+                        "size": [
+                            "width": el["width"] as? Int ?? 0,
+                            "height": el["height"] as? Int ?? 0,
+                        ],
+                        "actionable": el["actionable"] as? Bool ?? true,
+                        "source": "cdp",
+                    ]
+                    if let id = el["id"] as? String, !id.isEmpty {
+                        summary["dom_id"] = id
+                    }
+                    return summary
+                }
+                if !cdpSummaries.isEmpty {
+                    elements = cdpSummaries
+                    detectionMethod = "cdp"
+                }
+            }
+        }
+
+        // ── Note YOLO status ──────────────────────────────────────────────────────
+        // When the sidecar implements /detect, it will run here as a third strategy
+        // that can find elements invisible to both AX and CDP (e.g. canvas UIs).
+        let yoloAvailable = false  // Will become true when sidecar /detect is shipped
+        let vlmAvailable = VisionBridge.isAvailable()
+
+        // ── Build response ────────────────────────────────────────────────────────
+        var data: [String: Any] = [
+            "elements": elements,
+            "element_count": elements.count,
+            "app": appDisplayName,
+            "screenshot_width": screenshot.width,
+            "screenshot_height": screenshot.height,
+            "detection_method": detectionMethod,
+            "cdp_available": cdpAvailable,
+            "vlm_available": vlmAvailable,
+            "yolo_available": yoloAvailable,
+        ]
+
+        if !yoloAvailable {
+            data["yolo_note"] = "YOLO element detection is not yet implemented. " +
+                                "When available, it will detect canvas/WebGL elements " +
+                                "that AX and CDP cannot see."
+        }
+
+        let suggestion: String
+        if elements.isEmpty {
+            suggestion = "No interactive elements found. " +
+                         "For web apps with complex DOM, try ghost_ground with a visual description. " +
+                         "For native apps, ensure Accessibility permission is granted."
+        } else {
+            suggestion = "Use ghost_click with the element name or x/y coordinates. " +
+                         "For elements not listed (e.g. canvas or custom widgets), " +
+                         "use ghost_ground with a visual description to locate them."
+        }
+
         return ToolResult(
             success: true,
-            data: [
-                "note": "YOLO element detection not yet implemented. Vision sidecar is running.",
-                "sidecar_status": health?["status"] as? String ?? "unknown",
-                "models_loaded": health?["models_loaded"] as? [String] ?? [],
-                "screenshot_width": screenshot.width,
-                "screenshot_height": screenshot.height,
-            ],
-            suggestion: "Use ghost_find for AX-based element search, or ghost_ground to visually locate a specific element by description."
+            data: data,
+            suggestion: suggestion
         )
+    }
+
+    // MARK: - AX Element Collection (for ghost_parse_screen)
+
+    /// Interactive AX roles we collect in parseScreen.
+    private static let interactiveRoles: Set<String> = [
+        "AXButton", "AXLink", "AXTextField", "AXTextArea",
+        "AXCheckBox", "AXRadioButton", "AXPopUpButton",
+        "AXComboBox", "AXMenuButton", "AXTab", "AXSlider",
+        "AXMenuItem", "AXSearchField",
+    ]
+
+    /// Minimum number of AX elements required before skipping the CDP fallback.
+    /// Chrome's AX tree often returns very few meaningful elements for web apps
+    /// (everything is AXGroup), so below this threshold we also query the DOM via CDP.
+    private static let minAXElementsBeforeCDPFallback = 3
+
+    /// Maximum number of elements returned to the caller.
+    /// Keeps the MCP response payload manageable for the LLM context window.
+    private static let maxElementsReturned = 60
+
+    /// Internal over-collection cap. Deduplication can remove 30–50% of raw
+    /// elements, so we collect headroom before trimming to maxElementsReturned.
+    private static let maxCollectedElements = 200
+
+    /// Tolerance (in logical points) for position-based element deduplication.
+    /// Two elements within this distance with the same role are treated as one.
+    private static let deduplicationTolerancePixels = 5.0
+
+    /// Minimum element size (in logical points) for both dimensions.
+    /// Elements smaller than this are invisible in practice and cannot be
+    /// clicked reliably, so they are excluded from the results.
+    private static let minElementSizePixels = 8.0
+
+    /// Collect interactive elements from the AX tree with screen-absolute coordinates.
+    /// Uses the same semantic-depth tunneling as ghost_annotate so layout containers
+    /// (AXGroup, AXDiv) don't consume depth budget.
+    private static func collectAXElements(
+        for app: NSRunningApplication,
+        screenshot: ScreenshotResult,
+        results: inout [[String: Any]]
+    ) {
+        guard let appElement = Element.application(for: app.processIdentifier),
+              let window = appElement.focusedWindow() ?? appElement.mainWindow()
+        else { return }
+
+        appElement.setMessagingTimeout(3.0)
+        defer { appElement.setMessagingTimeout(0) }
+
+        var collected: [ParsedElement] = []
+        collectAXElementsRecursive(
+            from: window,
+            results: &collected,
+            windowX: screenshot.windowX,
+            windowY: screenshot.windowY,
+            windowWidth: screenshot.windowWidth,
+            windowHeight: screenshot.windowHeight,
+            semanticDepth: 0,
+            maxSemanticDepth: 15
+        )
+
+        // Deduplicate by position (within deduplicationTolerancePixels pt) and role
+        var deduped: [ParsedElement] = []
+        for elem in collected {
+            let dominated = deduped.contains { ex in
+                abs(ex.x - elem.x) < deduplicationTolerancePixels &&
+                abs(ex.y - elem.y) < deduplicationTolerancePixels &&
+                ex.role == elem.role
+            }
+            if !dominated { deduped.append(elem) }
+        }
+
+        // Sort: top-to-bottom, left-to-right
+        deduped.sort { a, b in
+            if abs(a.y - b.y) > 10 { return a.y < b.y }
+            return a.x < b.x
+        }
+
+        // AX position() returns the top-left corner of the element.
+        // We expose the center point so callers can pass it directly to ghost_click.
+        results = deduped.prefix(maxElementsReturned).map { elem in
+            var summary: [String: Any] = [
+                "role": elem.role,
+                "name": elem.name,
+                "position": ["x": Int(elem.x + elem.width / 2), "y": Int(elem.y + elem.height / 2)],
+                "size": ["width": Int(elem.width), "height": Int(elem.height)],
+                "actionable": true,
+                "source": "ax-tree",
+            ]
+            if !elem.domId.isEmpty { summary["dom_id"] = elem.domId }
+            return summary
+        }
+    }
+
+    /// Layout roles that cost zero semantic depth in the tunneling algorithm.
+    private static let layoutRoles: Set<String> = [
+        "AXGroup", "AXGenericElement", "AXSection", "AXDiv",
+        "AXList", "AXLandmarkMain", "AXLandmarkNavigation",
+        "AXLandmarkBanner", "AXLandmarkContentInfo",
+    ]
+
+    private struct ParsedElement {
+        let role: String
+        let name: String
+        let domId: String
+        let x: Double
+        let y: Double
+        let width: Double
+        let height: Double
+    }
+
+    private static func collectAXElementsRecursive(
+        from element: Element,
+        results: inout [ParsedElement],
+        windowX: Double,
+        windowY: Double,
+        windowWidth: Double,
+        windowHeight: Double,
+        semanticDepth: Int,
+        maxSemanticDepth: Int
+    ) {
+        guard semanticDepth <= maxSemanticDepth, results.count < maxCollectedElements else { return }
+
+        let role = element.role() ?? ""
+
+        // Semantic depth tunneling: empty layout containers cost 0
+        let hasContent: Bool
+        if layoutRoles.contains(role) {
+            let title = element.title()
+            let desc = element.descriptionText()
+            hasContent = title != nil || desc != nil
+        } else {
+            hasContent = true
+        }
+        let childDepth = hasContent ? semanticDepth + 1 : semanticDepth
+
+        if interactiveRoles.contains(role) {
+            if let pos = element.position(), let size = element.size() {
+                let x = Double(pos.x)
+                let y = Double(pos.y)
+                let w = Double(size.width)
+                let h = Double(size.height)
+
+                // Allow a small tolerance beyond the window frame: some elements
+                // have hit-test areas that slightly overflow their parent window.
+                let inBounds = x + w > windowX - deduplicationTolerancePixels &&
+                               x < windowX + windowWidth + deduplicationTolerancePixels &&
+                               y + h > windowY - deduplicationTolerancePixels &&
+                               y < windowY + windowHeight + deduplicationTolerancePixels
+
+                if inBounds && w >= minElementSizePixels && h >= minElementSizePixels {
+                    let name = element.computedName() ?? element.title() ?? ""
+                    let domId = element.rawAttributeValue(named: "AXDOMIdentifier") as? String ?? ""
+                    results.append(ParsedElement(
+                        role: role, name: name, domId: domId,
+                        x: x, y: y, width: w, height: h
+                    ))
+                }
+            }
+        }
+
+        guard let children = element.children() else { return }
+        for child in children {
+            collectAXElementsRecursive(
+                from: child, results: &results,
+                windowX: windowX, windowY: windowY,
+                windowWidth: windowWidth, windowHeight: windowHeight,
+                semanticDepth: childDepth, maxSemanticDepth: maxSemanticDepth
+            )
+        }
     }
 
     // MARK: - ghost_ground
