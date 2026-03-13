@@ -293,19 +293,29 @@ public enum CDPBridge {
     /// Convert CDP viewport coordinates to screen coordinates.
     /// Chrome's viewport coordinates are relative to the content area.
     /// We need to add the Chrome window's content area offset.
+    ///
+    /// - Parameters:
+    ///   - viewportX: X coordinate in Chrome's viewport space (from getBoundingClientRect)
+    ///   - viewportY: Y coordinate in Chrome's viewport space (from getBoundingClientRect)
+    ///   - windowX: Chrome window origin X in screen logical points
+    ///   - windowY: Chrome window origin Y in screen logical points
+    ///   - toolbarHeight: Combined height of Chrome's tab strip + address bar above the
+    ///     content area. Defaults to 88 pt, which covers the typical Chrome layout
+    ///     (tab strip ~36 pt + navigation bar ~52 pt) without the bookmarks bar.
+    ///     Pass a custom value (e.g. 116) when the bookmarks bar is also visible.
     public static func viewportToScreen(
         viewportX: Double,
         viewportY: Double,
         windowX: Double,
         windowY: Double,
-        titleBarHeight: Double = 36  // Chrome's title bar + tab bar height
+        toolbarHeight: Double = 88  // Chrome total: tab strip + navigation bar
     ) -> (x: Double, y: Double) {
-        // Chrome's content area starts after the title bar and toolbar
-        // Typical Chrome toolbar height: ~88px (title bar + tab bar + address bar)
-        let toolbarHeight = 88.0
+        // Chrome's DOM viewport origin sits below the tab strip and address bar.
+        // windowY is the top of the Chrome window frame (returned by AX position()),
+        // so we add the full toolbar height to reach the content area.
         return (
             x: windowX + viewportX,
-            y: windowY + titleBarHeight + toolbarHeight + viewportY
+            y: windowY + toolbarHeight + viewportY
         )
     }
 }
